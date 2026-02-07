@@ -102,10 +102,17 @@ export async function createSkillsProvider(
     });
   }
 
+  const SKILL_TOOL_NAMES = new Set(['load_skill', 'use_skill']);
+
+  function isSkillToolCall(name: string): boolean {
+    return SKILL_TOOL_NAMES.has(name);
+  }
+
   return {
     systemPrompt,
     tools,
     chatCompletionsTools,
+    isSkillToolCall,
     handleToolCall,
     skillNames,
     skills: skillsMap,

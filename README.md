@@ -25,7 +25,7 @@ const allTools = [...myTools, ...skills.chatCompletionsTools];
 
 // Handle tool calls in your agentic loop
 async function handleToolCall(name, args) {
-  if (name === 'load_skill' || name === 'use_skill') {
+  if (skills.isSkillToolCall(name)) {
     return await skills.handleToolCall(name, args);
   }
   // ...your other tools
@@ -108,6 +108,7 @@ const skills = await createSkillsProvider('./skills', {
 | `systemPrompt` | `string` | Inject into your system message |
 | `tools` | `ResponsesToolDefinition[]` | Responses API format (flat) |
 | `chatCompletionsTools` | `ChatCompletionsToolDefinition[]` | Chat Completions format (nested) |
+| `isSkillToolCall(name)` | `function` | Check if a tool call belongs to this provider |
 | `handleToolCall(name, args)` | `async function` | Execute `load_skill` or `use_skill` |
 | `skillNames` | `string[]` | Discovered skill names |
 | `skills` | `Map<string, SkillDefinition>` | Full skill definitions |

@@ -97,6 +97,9 @@ export interface SkillsProvider {
   /** Tool definitions in Chat Completions format (nested function) */
   chatCompletionsTools: ChatCompletionsToolDefinition[];
 
+  /** Check whether a tool call name belongs to this skills provider */
+  isSkillToolCall(name: string): boolean;
+
   /**
    * Handle a tool call from the agent.
    * For load_skill: returns the skill's markdown content (string).

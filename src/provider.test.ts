@@ -107,6 +107,14 @@ describe('createSkillsProvider', () => {
     assert.ok(provider.skills.has('weather'));
   });
 
+  it('isSkillToolCall identifies skill tools', async () => {
+    const provider = await createSkillsProvider(skillsDir);
+    assert.equal(provider.isSkillToolCall('load_skill'), true);
+    assert.equal(provider.isSkillToolCall('use_skill'), true);
+    assert.equal(provider.isSkillToolCall('get_weather'), false);
+    assert.equal(provider.isSkillToolCall(''), false);
+  });
+
   it('respects include filter', async () => {
     const provider = await createSkillsProvider(skillsDir, {
       include: ['discord'],
