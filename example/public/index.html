@@ -261,7 +261,7 @@
       modelInput.value = 'x-ai/grok-4.1-fast';
     });
 
-    const messages = []; // conversation history sent to server
+    let sessionId = null; // server manages conversation history
     let busy = false;
 
     // Auto-resize textarea
@@ -296,8 +296,6 @@
       // Hide empty state
       if (empty) empty.remove();
 
-      // Add user message
-      messages.push({ role: 'user', content: text });
       appendMsg('user', text);
 
       // Create streaming assistant message
@@ -310,7 +308,7 @@
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages, model: modelInput.value.trim() }),
+          body: JSON.stringify({ message: text, model: modelInput.value.trim(), sessionId }),
         });
 
         const reader = res.body.getReader();
@@ -331,6 +329,10 @@
             try { chunk = JSON.parse(line.slice(6)); } catch { continue; }
 
             switch (chunk.type) {
+              case 'session':
+                sessionId = chunk.sessionId;
+                break;
+
               case 'content':
                 assistantText += chunk.content;
                 assistantEl.innerHTML = renderMarkdown(assistantText);
@@ -361,9 +363,6 @@
       }
 
       assistantEl.classList.remove('streaming-cursor');
-      if (assistantText) {
-        messages.push({ role: 'assistant', content: assistantText });
-      }
 
       busy = false;
       sendBtn.disabled = false;

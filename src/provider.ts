@@ -15,13 +15,21 @@ export interface SkillDefinition {
   scripts: string[];
 }
 
-/** Result from executing a skill script */
+/** Internal result from script execution */
 export interface SkillExecutionResult {
   success: boolean;
   stdout: string;
   stderr: string;
   exitCode: number;
   error?: string;
+}
+
+/** Result shape returned to the model from SDK tools */
+export interface SkillToolResult {
+  ok: boolean;
+  result?: string;
+  error?: string;
+  message?: string;
 }
 
 /** Error types for structured error reporting */
@@ -32,6 +40,20 @@ export type SkillErrorType =
   | 'InvalidArgs'
   | 'ExecutionTimeout'
   | 'ExecutionFailed';
+
+/** Event emitted by processTurn for UI display */
+export interface TurnEvent {
+  type: 'tool_call' | 'tool_result';
+  name: string;
+  arguments?: string;
+  result?: string;
+}
+
+/** Output from processTurn */
+export interface TurnOutput {
+  text: string;
+  history: unknown[];
+}
 
 /** Options for createSkillsProvider / createSkillsTools */
 export interface SkillsProviderOptions {
@@ -52,18 +74,27 @@ export interface SkillsProvider {
 
 // --- Shared Zod schema for tool results ---
 
-const executionResultSchema = z.object({
-  success: z.boolean(),
-  stdout: z.string(),
-  stderr: z.string(),
-  exitCode: z.number(),
+const toolResultSchema = z.object({
+  ok: z.boolean(),
+  result: z.string().optional(),
   error: z.string().optional(),
+  message: z.string().optional(),
 });
 
-// --- Error helper ---
+// --- Helpers ---
 
 function fail(error: string, stderr = ''): SkillExecutionResult {
   return { success: false, stdout: '', stderr, exitCode: -1, error };
+}
+
+/** Reshape internal execution result to the thin format returned to models */
+function toToolResult(r: SkillExecutionResult): SkillToolResult {
+  if (r.success) {
+    return { ok: true, result: r.stdout };
+  }
+  const out: SkillToolResult = { ok: false, error: r.error };
+  if (r.stderr) out.message = r.stderr;
+  return out;
 }
 
 // --- Provider ---
@@ -164,13 +195,14 @@ export function createSdkTools(provider: SkillsProvider) {
   const loadSkillTool = tool({
     name: 'load_skill',
     description:
-      'Load the full instructions for a skill. Call this before using a skill to understand what scripts are available and how to use them.',
+      'Load a skill\'s instructions once to learn what scripts and commands it provides. ' +
+      'Only call this once per skill — the instructions stay in context for the rest of the conversation.',
     inputSchema: z.object({
       skill: z.string().describe(
-        `The name of the skill to load. Available: ${skillNames.join(', ')}`
+        `The skill to load. Available: ${skillNames.join(', ')}`
       ),
     }),
-    outputSchema: executionResultSchema,
+    outputSchema: toolResultSchema,
     nextTurnParams: {
       instructions: (params, context) => {
         const marker = `[Skill: ${params.skill}]`;
@@ -182,22 +214,26 @@ export function createSdkTools(provider: SkillsProvider) {
       },
     },
     execute: async ({ skill }) => {
-      return provider.handleToolCall('load_skill', { skill });
+      return toToolResult(await provider.handleToolCall('load_skill', { skill }));
     },
   });
 
   const useSkillTool = tool({
     name: 'use_skill',
     description:
-      'Run a script provided by a skill. You must load the skill first to know which scripts are available and what arguments they accept.',
+      'Run a script from a previously loaded skill. ' +
+      'Refer to the skill instructions already in your context for available scripts and arguments.',
     inputSchema: z.object({
-      skill: z.string().describe('The name of the skill that provides the script.'),
-      script: z.string().describe('The filename of the script to run.'),
+      skill: z.string().describe('The skill that provides the script.'),
+      script: z.string().describe('The script filename to run.'),
       args: z.array(z.string()).default([]).describe('Arguments to pass to the script.'),
+      remember: z.boolean().default(false).describe(
+        'Set to true if you want to reference the result of this request as you continue to perform your work - be conservative.'
+      ),
     }),
-    outputSchema: executionResultSchema,
+    outputSchema: toolResultSchema,
     execute: async ({ skill, script, args }) => {
-      return provider.handleToolCall('use_skill', { skill, script, args });
+      return toToolResult(await provider.handleToolCall('use_skill', { skill, script, args }));
     },
   });
 
@@ -219,4 +255,88 @@ export async function createSkillsTools(
 ) {
   const provider = await createSkillsProvider(skillsDir, options);
   return createSdkTools(provider);
+}
+
+// --- Turn processing helper ---
+
+/**
+ * Process a callModel result: stream tool events, collect history, and return final text.
+ *
+ * Handles the common pattern of iterating `getItemsStream()` for UI display while
+ * collecting SDK-format items for session history. Respects the `remember` flag on
+ * `use_skill` calls — when `false`, the tool call and its result are emitted to the
+ * callback for display but excluded from the returned history.
+ *
+ * ```ts
+ * const tools = await createSkillsTools('./skills');
+ * const result = client.callModel({ input: messages, tools, ... });
+ *
+ * const { text, history } = await processTurn(result, (event) => {
+ *   // stream event to UI (SSE, WebSocket, etc.)
+ * });
+ *
+ * messages.push(...history);
+ * messages.push({ role: 'assistant', content: text });
+ * ```
+ */
+export async function processTurn(
+  result: { getItemsStream(): AsyncIterable<Record<string, unknown>>; getText(): Promise<string> },
+  onEvent?: (event: TurnEvent) => void,
+): Promise<TurnOutput> {
+  const seenCalls = new Set<string>();
+  const seenResults = new Set<string>();
+  const callNames = new Map<string, string>();
+  const skipCallIds = new Set<string>();
+  const history: unknown[] = [];
+
+  for await (const item of result.getItemsStream()) {
+    if (item.type === 'function_call') {
+      const callId = item.callId as string;
+      const name = item.name as string;
+      callNames.set(callId, name);
+
+      if (item.status === 'completed' && !seenCalls.has(callId)) {
+        seenCalls.add(callId);
+
+        // Check remember flag on use_skill calls (default: don't persist)
+        let persist = true;
+        if (name === 'use_skill') {
+          try {
+            const args = JSON.parse(item.arguments as string);
+            if (args.remember !== true) persist = false;
+          } catch { /* don't persist if args can't be parsed */ }
+        }
+
+        if (persist) {
+          history.push({ type: 'function_call', callId, name, arguments: item.arguments });
+        } else {
+          skipCallIds.add(callId);
+        }
+
+        onEvent?.({
+          type: 'tool_call',
+          name,
+          arguments: item.arguments as string,
+        });
+      }
+    } else if (item.type === 'function_call_output') {
+      const callId = item.callId as string;
+      if (!seenResults.has(callId)) {
+        seenResults.add(callId);
+
+        if (!skipCallIds.has(callId)) {
+          history.push({ type: 'function_call_output', callId, output: item.output });
+        }
+
+        onEvent?.({
+          type: 'tool_result',
+          name: callNames.get(callId) ?? 'unknown',
+          result: item.output as string,
+        });
+      }
+    }
+  }
+
+  const text = await result.getText();
+  return { text, history };
 }

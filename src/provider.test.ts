@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createSkillsProvider, createSdkTools } from './provider.js';
+import { createSkillsProvider, createSdkTools, processTurn } from './provider.js';
 
 let skillsDir: string;
 
@@ -227,14 +227,15 @@ describe('createSdkTools', () => {
     }
   });
 
-  it('load_skill execute returns skill content', async () => {
+  it('load_skill execute returns ok with result', async () => {
     const provider = await createSkillsProvider(exampleSkillsDir);
     const tools = createSdkTools(provider);
     const loadTool = tools[0];
 
     const result = await loadTool.function.execute({ skill: 'discord' });
-    assert.equal(result.success, true);
-    assert.ok(result.stdout.length > 0);
+    assert.equal(result.ok, true);
+    assert.ok(result.result && result.result.length > 0);
+    assert.equal(result.error, undefined);
   });
 
   it('load_skill execute returns error for unknown skill', async () => {
@@ -243,8 +244,9 @@ describe('createSdkTools', () => {
     const loadTool = tools[0];
 
     const result = await loadTool.function.execute({ skill: 'nonexistent' });
-    assert.equal(result.success, false);
+    assert.equal(result.ok, false);
     assert.equal(result.error, 'SkillNotFound');
+    assert.equal(result.result, undefined);
   });
 
   it('use_skill execute runs a script', async () => {
@@ -257,8 +259,8 @@ describe('createSdkTools', () => {
       script: 'weather.mjs',
       args: ['forecast', 'Paris'],
     });
-    assert.equal(result.success, true);
-    assert.ok(result.stdout.length > 0);
+    assert.equal(result.ok, true);
+    assert.ok(result.result && result.result.length > 0);
   });
 
   it('load_skill has nextTurnParams for instructions injection', async () => {
@@ -316,5 +318,162 @@ describe('createSdkTools', () => {
     );
 
     assert.equal(result, 'Base.');
+  });
+
+  it('use_skill has remember parameter defaulting to true', async () => {
+    const provider = await createSkillsProvider(exampleSkillsDir);
+    const tools = createSdkTools(provider);
+    const useTool = tools[1];
+
+    const result = await useTool.function.execute({
+      skill: 'weather',
+      script: 'weather.mjs',
+      args: ['forecast', 'Paris'],
+      remember: true,
+    });
+    assert.equal(result.ok, true);
+  });
+});
+
+// --- processTurn tests ---
+
+function fakeResult(items: Record<string, unknown>[], text: string) {
+  return {
+    async *getItemsStream() { for (const i of items) yield i; },
+    async getText() { return text; },
+  };
+}
+
+describe('processTurn', () => {
+  it('collects history items and returns text', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true,"result":"..."}' },
+    ];
+
+    const { text, history } = await processTurn(fakeResult(items, 'Sunny today.'));
+
+    assert.equal(text, 'Sunny today.');
+    assert.equal(history.length, 2);
+    assert.deepEqual(history[0], { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}' });
+    assert.deepEqual(history[1], { type: 'function_call_output', callId: 'c1', output: '{"ok":true,"result":"..."}' });
+  });
+
+  it('emits events via callback', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true}' },
+    ];
+
+    const events: { type: string; name: string }[] = [];
+    await processTurn(fakeResult(items, ''), (e) => events.push(e));
+
+    assert.equal(events.length, 2);
+    assert.equal(events[0].type, 'tool_call');
+    assert.equal(events[0].name, 'load_skill');
+    assert.equal(events[1].type, 'tool_result');
+    assert.equal(events[1].name, 'load_skill');
+  });
+
+  it('excludes use_skill with remember:false from history', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'use_skill', arguments: '{"skill":"discord","script":"discord.mjs","args":["send","hi"],"remember":false}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true,"result":"sent"}' },
+    ];
+
+    const events: { type: string }[] = [];
+    const { history } = await processTurn(fakeResult(items, 'Done.'), (e) => events.push(e));
+
+    assert.equal(history.length, 0);
+    assert.equal(events.length, 2); // still emitted for UI
+  });
+
+  it('keeps use_skill with remember:true in history', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'use_skill', arguments: '{"skill":"weather","script":"weather.mjs","args":["forecast","NYC"],"remember":true}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true,"result":"20C"}' },
+    ];
+
+    const { history } = await processTurn(fakeResult(items, 'It is 20C.'));
+
+    assert.equal(history.length, 2);
+  });
+
+  it('excludes use_skill with default remember (false) from history', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'use_skill', arguments: '{"skill":"discord","script":"discord.mjs","args":["send","hi"]}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true,"result":"sent"}' },
+    ];
+
+    const { history } = await processTurn(fakeResult(items, 'Sent.'));
+
+    assert.equal(history.length, 0);
+  });
+
+  it('always keeps load_skill in history', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true,"result":"..."}' },
+    ];
+
+    const { history } = await processTurn(fakeResult(items, 'Loaded.'));
+
+    assert.equal(history.length, 2);
+  });
+
+  it('handles multiple tool calls with mixed remember flags', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"discord"}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true,"result":"loaded"}' },
+      { type: 'function_call', callId: 'c2', name: 'use_skill', arguments: '{"skill":"discord","script":"discord.mjs","args":["send","hi"]}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c2', output: '{"ok":true,"result":"sent"}' },
+      { type: 'function_call', callId: 'c3', name: 'use_skill', arguments: '{"skill":"discord","script":"discord.mjs","args":["channels","list"],"remember":true}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c3', output: '{"ok":true,"result":"[...]"}' },
+    ];
+
+    const events: { type: string }[] = [];
+    const { history } = await processTurn(fakeResult(items, 'Done.'), (e) => events.push(e));
+
+    assert.equal(history.length, 4); // load_skill(2) + remembered use_skill(2), skipped default(0)
+    assert.equal(events.length, 6); // all events emitted for UI
+  });
+
+  it('deduplicates repeated items', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true}' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true}' },
+    ];
+
+    const { history } = await processTurn(fakeResult(items, ''));
+
+    assert.equal(history.length, 2);
+  });
+
+  it('skips non-completed function_call items', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'in_progress' },
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true}' },
+    ];
+
+    const events: unknown[] = [];
+    const { history } = await processTurn(fakeResult(items, ''), (e) => events.push(e));
+
+    assert.equal(history.length, 2);
+    assert.equal(events.length, 2); // only the completed call + output
+  });
+
+  it('works with no onEvent callback', async () => {
+    const items = [
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true}' },
+    ];
+
+    const { text, history } = await processTurn(fakeResult(items, 'OK'));
+
+    assert.equal(text, 'OK');
+    assert.equal(history.length, 2);
   });
 });

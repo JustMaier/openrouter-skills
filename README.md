@@ -154,6 +154,26 @@ npm run example
 
 Open http://localhost:3000. The UI shows tool calls and results as the agent works, plus a model selector for any OpenRouter model ID.
 
+With the server running, you can also run the automated conversation test to see multi-turn behavior in action:
+
+```bash
+node example/scripts/test-conversation.mjs
+```
+
+This sends a 5-turn conversation (weather queries, Discord channel listing, sending messages) and prints a summary table showing which skills were loaded, which were used, and whether the model chose to `remember` each result:
+
+```
+Turn Request                       load_skill    use_skill                       remember
+----------------------------------------------------------------------------------------------
+1    What is the weather in Toky…  weather       weather.mjs forecast Tokyo      false
+2    What about in Paris?          --            weather.mjs forecast Paris      false
+3    List the Discord channels     discord       discord.mjs channels list       true
+4    Send a message saying Hello…  --            discord.mjs send Hello from t…  false
+5    Now send Build complete to …  --            discord.mjs send Build comple…  false
+```
+
+Skills are loaded once per session. The `remember` flag controls whether a `use_skill` result is kept in the conversation history — the model sets it to `true` for results it needs to reference later (like channel IDs) and `false` for fire-and-forget operations.
+
 ## Development
 
 ```bash

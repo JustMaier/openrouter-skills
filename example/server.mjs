@@ -3,7 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { join, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { OpenRouter, stepCountIs } from '@openrouter/sdk';
-import { createSkillsProvider, createSdkTools } from '../dist/index.js';
+import { createSkillsProvider, createSdkTools, processTurn } from '../dist/index.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PORT = process.env.PORT ?? 3000;
@@ -22,6 +22,19 @@ const sdkTools = createSdkTools(skills);
 console.log(`Loaded skills: ${skills.skillNames.join(', ')}`);
 
 const client = new OpenRouter({ apiKey: OPENROUTER_API_KEY });
+
+// --- Sessions (in-memory conversation history) ---
+
+const sessions = new Map(); // sessionId -> messages[]
+
+function getSession(id) {
+  if (!id || !sessions.has(id)) {
+    const sessionId = crypto.randomUUID();
+    sessions.set(sessionId, []);
+    return { sessionId, messages: sessions.get(sessionId) };
+  }
+  return { sessionId: id, messages: sessions.get(id) };
+}
 
 // --- MIME types ---
 
@@ -77,16 +90,19 @@ async function handleChat(req, res) {
     return;
   }
 
-  const messages = payload.messages ?? [];
+  const userMessage = payload.message?.trim();
   const model = payload.model || DEFAULT_MODEL;
 
-  if (messages.length === 0) {
+  if (!userMessage) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'No messages provided' }));
+    res.end(JSON.stringify({ error: 'No message provided' }));
     return;
   }
 
-  console.log(`[chat] model=${model} messages=${messages.length}`);
+  const { sessionId, messages } = getSession(payload.sessionId);
+  messages.push({ role: 'user', content: userMessage });
+
+  console.log(`[chat] session=${sessionId.slice(0, 8)} model=${model} messages=${messages.length}`);
 
   // SSE response
   res.writeHead(200, {
@@ -95,6 +111,9 @@ async function handleChat(req, res) {
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*',
   });
+
+  // Send sessionId so client can use it for subsequent requests
+  res.write(`data: ${JSON.stringify({ type: 'session', sessionId })}\n\n`);
 
   try {
     const result = client.callModel({
@@ -106,36 +125,19 @@ async function handleChat(req, res) {
       stopWhen: stepCountIs(10),
     });
 
-    // Stream all items across all turns (tool calls, results, and messages)
-    const callNames = new Map();   // callId -> tool name
-    const emittedCalls = new Set();
-    const emittedResults = new Set();
-
-    for await (const item of result.getItemsStream()) {
-      if (item.type === 'function_call') {
-        callNames.set(item.callId, item.name);
-        if (item.status === 'completed' && !emittedCalls.has(item.callId)) {
-          emittedCalls.add(item.callId);
-          res.write(`data: ${JSON.stringify({
-            type: 'tool_call',
-            name: item.name,
-            arguments: item.arguments,
-          })}\n\n`);
-        }
-      } else if (item.type === 'function_call_output' && !emittedResults.has(item.callId)) {
-        emittedResults.add(item.callId);
-        res.write(`data: ${JSON.stringify({
-          type: 'tool_result',
-          name: callNames.get(item.callId) ?? 'unknown',
-          result: item.output,
-        })}\n\n`);
+    const { text, history } = await processTurn(result, (event) => {
+      if (event.type === 'tool_call') {
+        res.write(`data: ${JSON.stringify({ type: 'tool_call', name: event.name, arguments: event.arguments })}\n\n`);
+      } else {
+        res.write(`data: ${JSON.stringify({ type: 'tool_result', name: event.name, result: event.result })}\n\n`);
       }
-    }
+    });
 
-    // Get the final text after all turns complete
-    const text = await result.getText();
     res.write(`data: ${JSON.stringify({ type: 'content', content: text })}\n\n`);
     res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+
+    messages.push(...history);
+    messages.push({ role: 'assistant', content: text });
   } catch (err) {
     res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
   }
