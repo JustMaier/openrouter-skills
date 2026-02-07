@@ -338,12 +338,12 @@
                 break;
 
               case 'tool_call':
-                appendToolEvent('call', chunk.name, chunk.arguments);
+                appendToolEvent('call', chunk.name, chunk.arguments, assistantEl);
                 scrollToBottom();
                 break;
 
               case 'tool_result':
-                appendToolEvent('result', chunk.name, chunk.result);
+                appendToolEvent('result', chunk.name, chunk.result, assistantEl);
                 scrollToBottom();
                 break;
 
@@ -379,7 +379,7 @@
       return el;
     }
 
-    function appendToolEvent(kind, name, body) {
+    function appendToolEvent(kind, name, body, beforeEl) {
       const el = document.createElement('div');
       el.className = `tool-event ${kind}`;
 
@@ -393,7 +393,7 @@
         <div class="label">${kind === 'call' ? 'Tool Call' : 'Result'}: ${escapeHtml(name)}</div>
         <div class="body">${escapeHtml(bodyText)}</div>
       `;
-      chat.appendChild(el);
+      chat.insertBefore(el, beforeEl);
     }
 
     function scrollToBottom() {
