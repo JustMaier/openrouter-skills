@@ -1,0 +1,42 @@
+{
+  "name": "openrouter-skills",
+  "version": "0.1.0",
+  "description": "Give OpenRouter agents skills via directory-based SKILL.md files and executable scripts",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "tsx --test src/**/*.test.ts",
+    "lint": "tsc --noEmit",
+    "example": "npm run build && node --env-file=example/.env example/server.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "openrouter",
+    "ai",
+    "tools",
+    "skills",
+    "agents",
+    "llm"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  }
+}
