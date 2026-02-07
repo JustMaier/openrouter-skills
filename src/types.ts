@@ -84,6 +84,8 @@ export interface SkillsProviderOptions {
   maxOutput?: number;
   /** Working directory for script execution (default process.cwd()) */
   cwd?: string;
+  /** Environment variables for script execution. If set, scripts see only these vars (plus PATH). */
+  env?: Record<string, string>;
 }
 
 /** The main interface returned by createSkillsProvider */
@@ -102,10 +104,10 @@ export interface SkillsProvider {
 
   /**
    * Handle a tool call from the agent.
-   * For load_skill: returns the skill's markdown content (string).
-   * For use_skill: returns a SkillExecutionResult.
+   * Returns a SkillExecutionResult for both load_skill and use_skill.
+   * For load_skill, the skill content is in stdout.
    */
-  handleToolCall(name: string, args: Record<string, unknown>): Promise<SkillExecutionResult | string>;
+  handleToolCall(name: string, args: Record<string, unknown>): Promise<SkillExecutionResult>;
 
   /** List of discovered skill names */
   skillNames: string[];

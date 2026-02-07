@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import type { SkillDefinition } from './types.js';
 
 const SKILL_FILENAME = 'SKILL.md';
-const SCRIPT_EXTENSIONS = new Set(['.mjs', '.js', '.sh', '.ts']);
+const SCRIPT_EXTENSIONS = new Set(['.mjs', '.js', '.sh']);
 
 /**
  * Parse simple YAML frontmatter from raw text.

@@ -4,7 +4,6 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createSkillsProvider } from './provider.js';
-import type { SkillExecutionResult } from './types.js';
 
 let skillsDir: string;
 
@@ -132,20 +131,21 @@ describe('createSkillsProvider', () => {
   });
 
   describe('handleToolCall', () => {
-    it('load_skill returns skill content', async () => {
+    it('load_skill returns structured result with content in stdout', async () => {
       const provider = await createSkillsProvider(skillsDir);
       const result = await provider.handleToolCall('load_skill', { skill: 'discord' });
-      assert.equal(typeof result, 'string');
-      assert.ok((result as string).includes('## Usage'));
-      assert.ok((result as string).includes('discord.mjs channels list'));
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.ok(result.stdout.includes('## Usage'));
+      assert.ok(result.stdout.includes('discord.mjs channels list'));
     });
 
-    it('load_skill returns error for unknown skill', async () => {
+    it('load_skill returns structured error for unknown skill', async () => {
       const provider = await createSkillsProvider(skillsDir);
       const result = await provider.handleToolCall('load_skill', { skill: 'nonexistent' });
-      assert.equal(typeof result, 'string');
-      assert.ok((result as string).includes('Error'));
-      assert.ok((result as string).includes('nonexistent'));
+      assert.equal(result.success, false);
+      assert.ok(result.error?.includes('SkillNotFound'));
+      assert.ok(result.error?.includes('nonexistent'));
     });
 
     it('use_skill executes a script successfully', async () => {
@@ -154,7 +154,7 @@ describe('createSkillsProvider', () => {
         skill: 'discord',
         script: 'discord.mjs',
         args: ['channels', 'list'],
-      }) as SkillExecutionResult;
+      });
 
       assert.equal(result.success, true);
       assert.equal(result.exitCode, 0);
@@ -162,17 +162,16 @@ describe('createSkillsProvider', () => {
       assert.deepEqual(parsed, [{ id: '1', name: 'general' }]);
     });
 
-    it('use_skill handles string args by splitting', async () => {
+    it('use_skill rejects string args with error', async () => {
       const provider = await createSkillsProvider(skillsDir);
       const result = await provider.handleToolCall('use_skill', {
         skill: 'discord',
         script: 'discord.mjs',
         args: 'channels list',  // string instead of array
-      }) as SkillExecutionResult;
+      });
 
-      assert.equal(result.success, true);
-      const parsed = JSON.parse(result.stdout);
-      assert.deepEqual(parsed, [{ id: '1', name: 'general' }]);
+      assert.equal(result.success, false);
+      assert.ok(result.error?.includes('InvalidArgs'));
     });
 
     it('use_skill returns SkillNotFound for unknown skill', async () => {
@@ -180,26 +179,26 @@ describe('createSkillsProvider', () => {
       const result = await provider.handleToolCall('use_skill', {
         skill: 'nonexistent',
         script: 'foo.mjs',
-      }) as SkillExecutionResult;
+      });
 
       assert.equal(result.success, false);
       assert.equal(result.error, 'SkillNotFound');
     });
 
-    it('use_skill returns ScriptNotFound for missing script', async () => {
+    it('use_skill blocks unregistered scripts', async () => {
       const provider = await createSkillsProvider(skillsDir);
       const result = await provider.handleToolCall('use_skill', {
         skill: 'discord',
         script: 'missing.mjs',
-      }) as SkillExecutionResult;
+      });
 
       assert.equal(result.success, false);
-      assert.equal(result.error, 'ScriptNotFound');
+      assert.ok(result.error?.includes('ScriptNotAllowed'));
     });
 
     it('returns error for unknown tool name', async () => {
       const provider = await createSkillsProvider(skillsDir);
-      const result = await provider.handleToolCall('unknown_tool', {}) as SkillExecutionResult;
+      const result = await provider.handleToolCall('unknown_tool', {});
 
       assert.equal(result.success, false);
       assert.ok(result.error?.includes('Unknown tool'));

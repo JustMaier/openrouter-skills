@@ -17,6 +17,8 @@ export interface ExecuteScriptOptions {
   maxOutput?: number;
   /** Working directory for the child process (default skillDir) */
   cwd?: string;
+  /** Environment variables for the child process. If set, replaces process.env. */
+  env?: Record<string, string>;
 }
 
 const DEFAULT_TIMEOUT = 30_000;
@@ -72,8 +74,6 @@ function resolveCommand(
     case '.mjs':
     case '.js':
       return { command: 'node', execArgs: [scriptPath, ...args] };
-    case '.ts':
-      return { command: 'npx', execArgs: ['tsx', scriptPath, ...args] };
     case '.sh':
       return { command: 'bash', execArgs: [scriptPath, ...args] };
     default:
@@ -114,6 +114,7 @@ export async function executeScript(
     timeout = DEFAULT_TIMEOUT,
     maxOutput = DEFAULT_MAX_OUTPUT,
     cwd,
+    env,
   } = options;
 
   // --- Security: validate script name ---
@@ -180,6 +181,7 @@ export async function executeScript(
         timeout,
         maxBuffer: maxOutput * 2, // Give some headroom; we cap manually
         windowsHide: true,
+        ...(env !== undefined && { env }),
       },
       (error, stdout, stderr) => {
         const cappedStdout = capOutput(stdout ?? '', maxOutput);

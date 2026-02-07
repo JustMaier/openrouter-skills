@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
-import { join, extname } from 'node:path';
+import { join, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createSkillsProvider } from '../dist/index.js';
 
@@ -34,10 +34,11 @@ const MIME = {
 
 async function serveStatic(req, res) {
   const url = req.url === '/' ? '/index.html' : req.url;
-  const filePath = join(__dirname, 'public', url);
+  const publicDir = resolve(join(__dirname, 'public'));
+  const filePath = resolve(join(publicDir, url));
 
   // Prevent path traversal
-  if (!filePath.startsWith(join(__dirname, 'public'))) {
+  if (!filePath.startsWith(publicDir + '/') && filePath !== publicDir) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
@@ -129,7 +130,7 @@ async function agentLoop(messages, onChunk, model) {
       }
 
       const result = await skills.handleToolCall(tc.name, args);
-      const content = typeof result === 'string' ? result : JSON.stringify(result);
+      const content = JSON.stringify(result);
 
       onChunk({ type: 'tool_result', name: tc.name, result: content });
 

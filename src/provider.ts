@@ -29,6 +29,13 @@ export async function createSkillsProvider(
 
   const skillsMap = new Map<string, SkillDefinition>();
   for (const skill of skillsList) {
+    if (skillsMap.has(skill.name)) {
+      const existing = skillsMap.get(skill.name)!;
+      console.warn(
+        `[openrouter-skills] Duplicate skill name "${skill.name}" ` +
+        `(${existing.dirPath} and ${skill.dirPath}). Using the latter.`
+      );
+    }
     skillsMap.set(skill.name, skill);
   }
 
@@ -40,7 +47,7 @@ export async function createSkillsProvider(
   async function handleToolCall(
     name: string,
     args: Record<string, unknown>,
-  ): Promise<SkillExecutionResult | string> {
+  ): Promise<SkillExecutionResult> {
     if (name === 'load_skill') {
       return handleLoadSkill(args);
     }
@@ -56,13 +63,24 @@ export async function createSkillsProvider(
     };
   }
 
-  function handleLoadSkill(args: Record<string, unknown>): string {
+  function handleLoadSkill(args: Record<string, unknown>): SkillExecutionResult {
     const skillName = String(args.skill ?? '');
     const skill = skillsMap.get(skillName);
     if (!skill) {
-      return `Error: Skill "${skillName}" not found. Available skills: ${skillNames.join(', ')}`;
+      return {
+        success: false,
+        stdout: '',
+        stderr: '',
+        exitCode: -1,
+        error: `SkillNotFound: "${skillName}" not found. Available skills: ${skillNames.join(', ')}`,
+      };
     }
-    return skill.content;
+    return {
+      success: true,
+      stdout: skill.content,
+      stderr: '',
+      exitCode: 0,
+    };
   }
 
   async function handleUseSkill(
@@ -72,13 +90,18 @@ export async function createSkillsProvider(
     const script = String(args.script ?? '');
     const rawArgs = args.args;
 
-    // Normalize args to string[]
+    // Args must be an array of strings
     let scriptArgs: string[] = [];
     if (Array.isArray(rawArgs)) {
       scriptArgs = rawArgs.map(String);
-    } else if (typeof rawArgs === 'string') {
-      // Fallback: if model sends a string instead of array, split on spaces
-      scriptArgs = rawArgs.split(/\s+/).filter(Boolean);
+    } else if (rawArgs !== undefined && rawArgs !== null) {
+      return {
+        success: false,
+        stdout: '',
+        stderr: '',
+        exitCode: -1,
+        error: 'InvalidArgs: args must be an array of strings, got ' + typeof rawArgs,
+      };
     }
 
     const skill = skillsMap.get(skillName);
@@ -92,6 +115,17 @@ export async function createSkillsProvider(
       };
     }
 
+    // Validate script is in the skill's discovered scripts list
+    if (!skill.scripts.includes(script)) {
+      return {
+        success: false,
+        stdout: '',
+        stderr: '',
+        exitCode: -1,
+        error: `ScriptNotAllowed: "${script}" is not a registered script for skill "${skillName}". Available: ${skill.scripts.join(', ') || 'none'}`,
+      };
+    }
+
     return executeScript({
       skillDir: skill.dirPath,
       script,
@@ -99,6 +133,7 @@ export async function createSkillsProvider(
       timeout: options.timeout,
       maxOutput: options.maxOutput,
       cwd: options.cwd,
+      env: options.env,
     });
   }
 
