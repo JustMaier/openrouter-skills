@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { access, constants } from 'node:fs/promises';
 import path from 'node:path';
-import type { SkillExecutionResult } from './types.js';
+import type { SkillExecutionResult } from './provider.js';
 
 /** Options for executeScript */
 export interface ExecuteScriptOptions {

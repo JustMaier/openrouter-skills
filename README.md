@@ -13,17 +13,16 @@ npm install openrouter-skills @openrouter/sdk zod
 ## Quick Start
 
 ```typescript
-import OpenRouter, { stepCountIs } from '@openrouter/sdk';
-import { createSkillsProvider, createSdkTools } from 'openrouter-skills';
+import { OpenRouter, stepCountIs } from '@openrouter/sdk';
+import { createSkillsTools } from 'openrouter-skills';
 
 const client = new OpenRouter({ apiKey: process.env.OPENROUTER_API_KEY });
-const skills = await createSkillsProvider('./skills');
 
 const result = client.callModel({
   model: 'anthropic/claude-sonnet-4',
   instructions: 'You are a helpful assistant.',
   input: 'Send "Hello World" to #dev on Discord',
-  tools: createSdkTools(skills),
+  tools: await createSkillsTools('./skills'),
   stopWhen: stepCountIs(10),
 });
 
@@ -88,12 +87,12 @@ The `name` defaults to the folder name if omitted. The `description` is used in 
 
 ## API
 
-### `createSkillsProvider(skillsDir, options?)`
+### `createSkillsTools(skillsDir, options?)` — primary API
 
-Discovers skills and prepares the execution layer.
+Discovers skills and returns SDK tools in one step. Pass the result directly to `callModel({ tools })`.
 
 ```typescript
-const skills = await createSkillsProvider('./skills', {
+const tools = await createSkillsTools('./skills', {
   include: ['discord'],    // only load these skills
   exclude: ['internal'],   // skip these skills
   timeout: 30000,          // script timeout in ms (default 30s)
@@ -103,18 +102,16 @@ const skills = await createSkillsProvider('./skills', {
 });
 ```
 
-### `createSdkTools(skills)`
+### `createSkillsProvider(skillsDir, options?)` + `createSdkTools(provider)`
 
-Creates SDK-compatible tools from a provider. Pass the result to `callModel({ tools })`.
+Two-step API for when you need access to the skills map or metadata:
 
 ```typescript
-const sdkTools = createSdkTools(skills);
+const provider = await createSkillsProvider('./skills');
+console.log(provider.skillNames);     // ['discord', 'weather']
+console.log(provider.skills.size);    // 2
 
-const result = client.callModel({
-  model: 'anthropic/claude-sonnet-4',
-  input: 'Check the weather in Paris',
-  tools: sdkTools,
-});
+const tools = createSdkTools(provider);
 ```
 
 ### Error Codes
@@ -141,7 +138,7 @@ Tool execution returns a `SkillExecutionResult`. On failure, `result.error` cont
 
 ## Example App
 
-A working chat app using the SDK with streaming:
+A working chat app with tool call visibility:
 
 ```bash
 cd example
@@ -155,14 +152,14 @@ Or from the project root:
 npm run example
 ```
 
-Open http://localhost:3000. The UI includes a model selector — type any OpenRouter model ID or pick from the dropdown.
+Open http://localhost:3000. The UI shows tool calls and results as the agent works, plus a model selector for any OpenRouter model ID.
 
 ## Development
 
 ```bash
 npm install
 npm run build    # compile TypeScript
-npm test         # run 45 tests (parser, executor, provider, sdk)
+npm test         # run tests (parser, executor, provider, sdk)
 npm run lint     # type-check without emitting
 ```
 

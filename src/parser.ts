@@ -1,6 +1,6 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { SkillDefinition } from './types.js';
+import type { SkillDefinition } from './provider.js';
 
 const SKILL_FILENAME = 'SKILL.md';
 const SCRIPT_EXTENSIONS = new Set(['.mjs', '.js', '.sh']);

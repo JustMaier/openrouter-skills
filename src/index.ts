@@ -1,5 +1,9 @@
-export { createSkillsProvider } from './provider.js';
-export { createSdkTools } from './sdk.js';
+export {
+  createSkillsTools,
+  createSkillsProvider,
+  createSdkTools,
+} from './provider.js';
+
 export { parseSkillFile, discoverSkills } from './parser.js';
 export { executeScript } from './executor.js';
 export type { ExecuteScriptOptions } from './executor.js';
@@ -10,4 +14,4 @@ export type {
   SkillErrorType,
   SkillsProvider,
   SkillsProviderOptions,
-} from './types.js';
+} from './provider.js';

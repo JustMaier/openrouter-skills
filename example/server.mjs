@@ -106,6 +106,33 @@ async function handleChat(req, res) {
       stopWhen: stepCountIs(10),
     });
 
+    // Stream all items across all turns (tool calls, results, and messages)
+    const callNames = new Map();   // callId -> tool name
+    const emittedCalls = new Set();
+    const emittedResults = new Set();
+
+    for await (const item of result.getItemsStream()) {
+      if (item.type === 'function_call') {
+        callNames.set(item.callId, item.name);
+        if (item.status === 'completed' && !emittedCalls.has(item.callId)) {
+          emittedCalls.add(item.callId);
+          res.write(`data: ${JSON.stringify({
+            type: 'tool_call',
+            name: item.name,
+            arguments: item.arguments,
+          })}\n\n`);
+        }
+      } else if (item.type === 'function_call_output' && !emittedResults.has(item.callId)) {
+        emittedResults.add(item.callId);
+        res.write(`data: ${JSON.stringify({
+          type: 'tool_result',
+          name: callNames.get(item.callId) ?? 'unknown',
+          result: item.output,
+        })}\n\n`);
+      }
+    }
+
+    // Get the final text after all turns complete
     const text = await result.getText();
     res.write(`data: ${JSON.stringify({ type: 'content', content: text })}\n\n`);
     res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
