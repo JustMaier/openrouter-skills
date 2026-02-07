@@ -22,7 +22,7 @@ export interface SkillExecutionResult {
   stdout: string;
   stderr: string;
   exitCode: number;
-  /** Set on failure: SkillNotFound, ScriptNotFound, ScriptNotAllowed, ExecutionTimeout, ExecutionFailed */
+  /** Set on failure: SkillNotFound, ScriptNotFound, ScriptNotAllowed, InvalidArgs, ExecutionTimeout, ExecutionFailed */
   error?: string;
 }
 
@@ -31,44 +31,9 @@ export type SkillErrorType =
   | 'SkillNotFound'
   | 'ScriptNotFound'
   | 'ScriptNotAllowed'
+  | 'InvalidArgs'
   | 'ExecutionTimeout'
   | 'ExecutionFailed';
-
-// --- Tool Definitions (Responses API format) ---
-
-/** OpenRouter Responses API tool definition (flat, no function wrapper) */
-export interface ResponsesToolDefinition {
-  type: 'function';
-  name: string;
-  description: string;
-  parameters: {
-    type: 'object';
-    properties: Record<string, JsonSchemaProperty>;
-    required?: string[];
-  };
-}
-
-/** JSON Schema property for tool parameters */
-export interface JsonSchemaProperty {
-  type: string;
-  description?: string;
-  enum?: string[];
-  items?: { type: string };
-}
-
-/** OpenRouter Chat Completions tool definition (nested function wrapper) */
-export interface ChatCompletionsToolDefinition {
-  type: 'function';
-  function: {
-    name: string;
-    description: string;
-    parameters: {
-      type: 'object';
-      properties: Record<string, JsonSchemaProperty>;
-      required?: string[];
-    };
-  };
-}
 
 // --- Provider ---
 
@@ -90,18 +55,6 @@ export interface SkillsProviderOptions {
 
 /** The main interface returned by createSkillsProvider */
 export interface SkillsProvider {
-  /** System prompt section listing all discovered skills */
-  systemPrompt: string;
-
-  /** Tool definitions in Responses API format (flat) */
-  tools: ResponsesToolDefinition[];
-
-  /** Tool definitions in Chat Completions format (nested function) */
-  chatCompletionsTools: ChatCompletionsToolDefinition[];
-
-  /** Check whether a tool call name belongs to this skills provider */
-  isSkillToolCall(name: string): boolean;
-
   /**
    * Handle a tool call from the agent.
    * Returns a SkillExecutionResult for both load_skill and use_skill.

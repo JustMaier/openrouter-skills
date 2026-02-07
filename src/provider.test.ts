@@ -81,37 +81,11 @@ describe('createSkillsProvider', () => {
     assert.equal(provider.skillNames.length, 3);
   });
 
-  it('generates a system prompt with skill listings', async () => {
-    const provider = await createSkillsProvider(skillsDir);
-    assert.ok(provider.systemPrompt.includes('## Available Skills'));
-    assert.ok(provider.systemPrompt.includes('### discord'));
-    assert.ok(provider.systemPrompt.includes('Discord integration.'));
-    assert.ok(provider.systemPrompt.includes('### weather'));
-  });
-
-  it('provides tool definitions in both formats', async () => {
-    const provider = await createSkillsProvider(skillsDir);
-    assert.equal(provider.tools.length, 2);
-    assert.equal(provider.chatCompletionsTools.length, 2);
-
-    const toolNames = provider.tools.map((t) => t.name);
-    assert.ok(toolNames.includes('load_skill'));
-    assert.ok(toolNames.includes('use_skill'));
-  });
-
   it('exposes skills map', async () => {
     const provider = await createSkillsProvider(skillsDir);
     assert.equal(provider.skills.size, 3);
     assert.ok(provider.skills.has('discord'));
     assert.ok(provider.skills.has('weather'));
-  });
-
-  it('isSkillToolCall identifies skill tools', async () => {
-    const provider = await createSkillsProvider(skillsDir);
-    assert.equal(provider.isSkillToolCall('load_skill'), true);
-    assert.equal(provider.isSkillToolCall('use_skill'), true);
-    assert.equal(provider.isSkillToolCall('get_weather'), false);
-    assert.equal(provider.isSkillToolCall(''), false);
   });
 
   it('respects include filter', async () => {

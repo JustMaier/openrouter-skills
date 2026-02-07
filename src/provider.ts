@@ -7,14 +7,12 @@ import type {
 } from './types.js';
 import { discoverSkills } from './parser.js';
 import { executeScript } from './executor.js';
-import { generateSystemPrompt, getToolDefinitions, getChatCompletionsToolDefinitions } from './prompt.js';
 
 /**
  * Create a SkillsProvider by scanning a directory for skills.
  *
- * Returns an object with everything needed to wire skills into an
- * OpenRouter agent: system prompt, tool definitions, and a handler
- * for tool calls.
+ * Returns an object with the skill map and a handler for tool calls.
+ * Pass the result to `createSdkTools()` to get tools for `callModel`.
  */
 export async function createSkillsProvider(
   skillsDir: string,
@@ -39,9 +37,6 @@ export async function createSkillsProvider(
     skillsMap.set(skill.name, skill);
   }
 
-  const systemPrompt = generateSystemPrompt(skillsList);
-  const tools = getToolDefinitions();
-  const chatCompletionsTools = getChatCompletionsToolDefinitions();
   const skillNames = skillsList.map((s) => s.name);
 
   async function handleToolCall(
@@ -137,17 +132,7 @@ export async function createSkillsProvider(
     });
   }
 
-  const SKILL_TOOL_NAMES = new Set(['load_skill', 'use_skill']);
-
-  function isSkillToolCall(name: string): boolean {
-    return SKILL_TOOL_NAMES.has(name);
-  }
-
   return {
-    systemPrompt,
-    tools,
-    chatCompletionsTools,
-    isSkillToolCall,
     handleToolCall,
     skillNames,
     skills: skillsMap,

@@ -1,8 +1,9 @@
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
-import { join, extname, resolve } from 'node:path';
+import { join, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createSkillsProvider } from '../dist/index.js';
+import { OpenRouter, stepCountIs } from '@openrouter/sdk';
+import { createSkillsProvider, createSdkTools } from '../dist/index.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PORT = process.env.PORT ?? 3000;
@@ -17,7 +18,10 @@ if (!OPENROUTER_API_KEY) {
 // --- Skills setup ---
 
 const skills = await createSkillsProvider(join(__dirname, 'skills'));
+const sdkTools = createSdkTools(skills);
 console.log(`Loaded skills: ${skills.skillNames.join(', ')}`);
+
+const client = new OpenRouter({ apiKey: OPENROUTER_API_KEY });
 
 // --- MIME types ---
 
@@ -38,7 +42,7 @@ async function serveStatic(req, res) {
   const filePath = resolve(join(publicDir, url));
 
   // Prevent path traversal
-  if (!filePath.startsWith(publicDir + '/') && filePath !== publicDir) {
+  if (!filePath.startsWith(publicDir + sep) && filePath !== publicDir) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
@@ -58,152 +62,7 @@ async function serveStatic(req, res) {
   }
 }
 
-// --- OpenRouter Chat Completions agentic loop ---
-
-async function agentLoop(messages, onChunk, model) {
-  const systemPrompt = [
-    'You are a helpful assistant with access to skills.',
-    'When the user asks you to do something covered by a skill, load it first, then use it.',
-    '',
-    skills.systemPrompt,
-  ].join('\n');
-
-  const conversation = [
-    { role: 'system', content: systemPrompt },
-    ...messages,
-  ];
-
-  const MAX_ROUNDS = 10;
-
-  for (let round = 0; round < MAX_ROUNDS; round++) {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages: conversation,
-        tools: skills.chatCompletionsTools,
-        tool_choice: 'auto',
-        max_tokens: 4096,
-        stream: true,
-      }),
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      onChunk({ type: 'error', error: `OpenRouter ${response.status}: ${body}` });
-      return;
-    }
-
-    // Parse SSE stream
-    const { text, toolCalls } = await parseStream(response.body, onChunk);
-
-    // If we got text and no tool calls, we're done
-    if (toolCalls.length === 0) {
-      onChunk({ type: 'done' });
-      return;
-    }
-
-    // Add assistant message with tool calls to conversation
-    conversation.push({
-      role: 'assistant',
-      content: text || null,
-      tool_calls: toolCalls.map((tc) => ({
-        id: tc.id,
-        type: 'function',
-        function: { name: tc.name, arguments: tc.arguments },
-      })),
-    });
-
-    // Execute each tool call
-    for (const tc of toolCalls) {
-      onChunk({ type: 'tool_call', name: tc.name, arguments: tc.arguments });
-
-      let args;
-      try {
-        args = JSON.parse(tc.arguments);
-      } catch {
-        args = {};
-      }
-
-      const result = await skills.handleToolCall(tc.name, args);
-      const content = JSON.stringify(result);
-
-      onChunk({ type: 'tool_result', name: tc.name, result: content });
-
-      conversation.push({
-        role: 'tool',
-        tool_call_id: tc.id,
-        content,
-      });
-    }
-  }
-
-  onChunk({ type: 'error', error: 'Max tool rounds exceeded' });
-}
-
-// --- SSE stream parser ---
-
-async function parseStream(body, onChunk) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let text = '';
-  const toolCallMap = new Map(); // index -> { id, name, arguments }
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // keep incomplete line
-
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const data = line.slice(6).trim();
-      if (data === '[DONE]') continue;
-
-      let parsed;
-      try {
-        parsed = JSON.parse(data);
-      } catch {
-        continue;
-      }
-
-      const delta = parsed.choices?.[0]?.delta;
-      if (!delta) continue;
-
-      // Text content
-      if (delta.content) {
-        text += delta.content;
-        onChunk({ type: 'content', content: delta.content });
-      }
-
-      // Tool calls (streamed incrementally)
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0;
-          if (!toolCallMap.has(idx)) {
-            toolCallMap.set(idx, { id: tc.id || '', name: '', arguments: '' });
-          }
-          const entry = toolCallMap.get(idx);
-          if (tc.id) entry.id = tc.id;
-          if (tc.function?.name) entry.name += tc.function.name;
-          if (tc.function?.arguments) entry.arguments += tc.function.arguments;
-        }
-      }
-    }
-  }
-
-  return { text, toolCalls: [...toolCallMap.values()] };
-}
-
-// --- Chat API endpoint ---
+// --- Chat API endpoint using SDK callModel ---
 
 async function handleChat(req, res) {
   let body = '';
@@ -237,9 +96,22 @@ async function handleChat(req, res) {
     'Access-Control-Allow-Origin': '*',
   });
 
-  await agentLoop(messages, (chunk) => {
-    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-  }, model);
+  try {
+    const result = client.callModel({
+      model,
+      instructions: 'You are a helpful assistant with access to skills.\n' +
+        'When the user asks you to do something covered by a skill, load it first, then use it.',
+      input: messages,
+      tools: sdkTools,
+      stopWhen: stepCountIs(10),
+    });
+
+    const text = await result.getText();
+    res.write(`data: ${JSON.stringify({ type: 'content', content: text })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+  } catch (err) {
+    res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+  }
 
   res.end();
 }

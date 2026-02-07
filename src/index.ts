@@ -1,8 +1,8 @@
 export { createSkillsProvider } from './provider.js';
+export { createSdkTools } from './sdk.js';
 export { parseSkillFile, discoverSkills } from './parser.js';
 export { executeScript } from './executor.js';
 export type { ExecuteScriptOptions } from './executor.js';
-export { generateSystemPrompt, getToolDefinitions, getChatCompletionsToolDefinitions } from './prompt.js';
 
 export type {
   SkillDefinition,
@@ -10,7 +10,4 @@ export type {
   SkillErrorType,
   SkillsProvider,
   SkillsProviderOptions,
-  ResponsesToolDefinition,
-  ChatCompletionsToolDefinition,
-  JsonSchemaProperty,
 } from './types.js';
