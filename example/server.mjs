@@ -33,7 +33,7 @@ if (!OPENROUTER_API_KEY) {
 
 const skillsDirs = [
   join(__dirname, 'skills'),                // project-local example skills
-  join(homedir(), '.claude', 'skills'),     // user-scope Claude skills
+  // join(homedir(), '.claude', 'skills'),     // user-scope Claude skills
 ];
 const skills = await createSkillsProvider(skillsDirs);
 console.log(`Loaded skills: ${skills.skillNames.join(', ')}`);
