@@ -163,6 +163,34 @@
     #input-area button:hover { background: #2ea043; }
     #input-area button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
 
+    #model-select {
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #e1e4e8;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+      font-family: 'SF Mono', Consolas, monospace;
+      outline: none;
+      cursor: pointer;
+    }
+
+    #model-select:focus { border-color: #58a6ff; }
+
+    #new-chat-btn {
+      background: transparent;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      border-radius: 6px;
+      padding: 4px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+      white-space: nowrap;
+    }
+
+    #new-chat-btn:hover { border-color: #58a6ff; color: #e1e4e8; }
+
     .empty-state {
       text-align: center;
       color: #484f58;
@@ -206,24 +234,16 @@
   <header>
     <h1>Skills-as-Tools</h1>
     <span class="badge">Demo</span>
-    <div style="margin-left:auto; display:flex; align-items:center; gap:6px;">
-      <label for="model-input" style="font-size:12px; color:#8b949e;">Model:</label>
-      <input id="model-input" type="text" list="model-list" spellcheck="false"
-        style="background:#161b22; border:1px solid #30363d; color:#e1e4e8; border-radius:6px;
-               padding:4px 10px; font-size:12px; font-family:'SF Mono',Consolas,monospace;
-               width:260px; outline:none;"
-        placeholder="loading...">
-      <datalist id="model-list">
-        <option value="x-ai/grok-4.1-fast">
-        <option value="anthropic/claude-sonnet-4">
-        <option value="anthropic/claude-haiku-4">
-        <option value="openai/gpt-4.1-mini">
-        <option value="openai/gpt-4.1-nano">
-        <option value="google/gemini-2.5-flash">
-        <option value="google/gemini-2.5-pro">
-        <option value="meta-llama/llama-4-maverick">
-        <option value="deepseek/deepseek-chat-v3-0324">
-      </datalist>
+    <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
+      <label for="model-select" style="font-size:12px; color:#8b949e;">Model:</label>
+      <select id="model-select">
+        <option value="">Loading...</option>
+      </select>
+      <input id="custom-model" type="text" spellcheck="false" placeholder="org/model-name"
+        style="display:none; background:#161b22; border:1px solid #30363d; color:#e1e4e8;
+               border-radius:6px; padding:4px 8px; font-size:12px;
+               font-family:'SF Mono',Consolas,monospace; width:220px; outline:none;">
+      <button id="new-chat-btn">New Chat</button>
     </div>
   </header>
 
@@ -251,18 +271,43 @@
     const form = document.getElementById('form');
     const input = document.getElementById('input');
     const sendBtn = document.getElementById('send-btn');
-    const empty = document.getElementById('empty');
-    const modelInput = document.getElementById('model-input');
+    const modelSelect = document.getElementById('model-select');
+    const customModel = document.getElementById('custom-model');
+    const newChatBtn = document.getElementById('new-chat-btn');
 
-    // Load default model from server
+    const emptyStateHtml = document.getElementById('empty').outerHTML;
+
+    function getModel() {
+      return modelSelect.value === '__custom__' ? customModel.value.trim() : modelSelect.value;
+    }
+
+    // Load models from server
     fetch('/api/config').then(r => r.json()).then(cfg => {
-      modelInput.value = cfg.defaultModel;
+      modelSelect.innerHTML = cfg.models
+        .map(m => `<option value="${m}"${m === cfg.defaultModel ? ' selected' : ''}>${m}</option>`)
+        .join('') + '<option value="__custom__">Other...</option>';
     }).catch(() => {
-      modelInput.value = 'x-ai/grok-4.1-fast';
+      modelSelect.innerHTML = '<option value="anthropic/claude-sonnet-4">anthropic/claude-sonnet-4</option>'
+        + '<option value="__custom__">Other...</option>';
+    });
+
+    modelSelect.addEventListener('change', () => {
+      customModel.style.display = modelSelect.value === '__custom__' ? '' : 'none';
+      if (modelSelect.value === '__custom__') customModel.focus();
     });
 
     let sessionId = null; // server manages conversation history
     let busy = false;
+
+    // New Chat button
+    newChatBtn.addEventListener('click', () => {
+      if (busy) return;
+      sessionId = null;
+      chat.innerHTML = emptyStateHtml;
+      input.value = '';
+      input.style.height = 'auto';
+      input.focus();
+    });
 
     // Auto-resize textarea
     input.addEventListener('input', () => {
@@ -294,6 +339,7 @@
       input.style.height = 'auto';
 
       // Hide empty state
+      const empty = document.getElementById('empty');
       if (empty) empty.remove();
 
       appendMsg('user', text);
@@ -308,7 +354,7 @@
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text, model: modelInput.value.trim(), sessionId }),
+          body: JSON.stringify({ message: text, model: getModel(), sessionId }),
         });
 
         const reader = res.body.getReader();
@@ -333,10 +379,19 @@
                 sessionId = chunk.sessionId;
                 break;
 
-              case 'content':
-                assistantText += chunk.content;
+              case 'text_delta':
+                assistantText += chunk.delta;
                 assistantEl.innerHTML = renderMarkdown(assistantText);
                 scrollToBottom();
+                break;
+
+              case 'content':
+                // Final reconciliation — replace with authoritative full text
+                if (chunk.content) {
+                  assistantText = chunk.content;
+                  assistantEl.innerHTML = renderMarkdown(assistantText);
+                  scrollToBottom();
+                }
                 break;
 
               case 'tool_call':

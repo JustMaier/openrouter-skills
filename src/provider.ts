@@ -1,7 +1,8 @@
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { stat } from 'node:fs/promises';
 import { tool } from '@openrouter/sdk';
 import { z } from 'zod';
-import { discoverSkills } from './parser.js';
+import { discoverSkills, loadSkill } from './parser.js';
 import { executeScript } from './executor.js';
 
 // --- Types ---
@@ -24,29 +25,13 @@ export interface SkillExecutionResult {
   error?: string;
 }
 
-/** Result shape returned to the model from SDK tools */
-export interface SkillToolResult {
-  ok: boolean;
-  result?: string;
-  error?: string;
-  message?: string;
-}
-
-/** Error types for structured error reporting */
-export type SkillErrorType =
-  | 'SkillNotFound'
-  | 'ScriptNotFound'
-  | 'ScriptNotAllowed'
-  | 'InvalidArgs'
-  | 'ExecutionTimeout'
-  | 'ExecutionFailed';
-
 /** Event emitted by processTurn for UI display */
 export interface TurnEvent {
-  type: 'tool_call' | 'tool_result';
-  name: string;
+  type: 'tool_call' | 'tool_result' | 'text_delta';
+  name?: string;
   arguments?: string;
   result?: string;
+  delta?: string;
 }
 
 /** Output from processTurn */
@@ -81,6 +66,9 @@ const toolResultSchema = z.object({
   message: z.string().optional(),
 });
 
+/** Result shape returned to the model from SDK tools */
+export type SkillToolResult = z.infer<typeof toolResultSchema>;
+
 // --- Helpers ---
 
 function fail(error: string, stderr = ''): SkillExecutionResult {
@@ -88,7 +76,7 @@ function fail(error: string, stderr = ''): SkillExecutionResult {
 }
 
 /** Reshape internal execution result to the thin format returned to models */
-function toToolResult(r: SkillExecutionResult): SkillToolResult {
+export function toToolResult(r: SkillExecutionResult): SkillToolResult {
   if (r.success) {
     return { ok: true, result: r.stdout };
   }
@@ -100,85 +88,143 @@ function toToolResult(r: SkillExecutionResult): SkillToolResult {
 // --- Provider ---
 
 /**
- * Create a SkillsProvider by scanning a directory for skills.
+ * Create a SkillsProvider by scanning one or more directories for skills.
+ *
+ * When multiple directories are provided, all are scanned and their skills are merged.
+ * If the same skill name appears in multiple directories, the first directory wins.
  *
  * For most use cases, prefer `createSkillsTools()` which returns SDK tools directly.
  * Use this when you need access to the skills map or handleToolCall for custom integrations.
  */
 export async function createSkillsProvider(
-  skillsDir: string,
+  skillsDirs: string | string[],
   options: SkillsProviderOptions = {},
 ): Promise<SkillsProvider> {
-  const resolvedDir = resolve(skillsDir);
+  const dirs = Array.isArray(skillsDirs) ? skillsDirs : [skillsDirs];
+  const resolvedDirs = dirs.map(d => resolve(d));
 
-  const skillsList = await discoverSkills(resolvedDir, {
-    include: options.include,
-    exclude: options.exclude,
-  });
+  const filterOpts = { include: options.include, exclude: options.exclude };
+  const nested = await Promise.all(resolvedDirs.map(d => discoverSkills(d, filterOpts)));
+  const skillsList = nested.flat();
 
   const skillsMap = new Map<string, SkillDefinition>();
-  for (const skill of skillsList) {
-    if (skillsMap.has(skill.name)) {
-      const existing = skillsMap.get(skill.name)!;
-      console.warn(
-        `[openrouter-skills] Duplicate skill name "${skill.name}" ` +
-        `(${existing.dirPath} and ${skill.dirPath}). Using the latter.`
-      );
+  const mtimes = new Map<string, number>(); // skillName → SKILL.md mtimeMs
+
+  /** Add skills to the map, skipping duplicates (first wins). */
+  async function addSkills(list: SkillDefinition[], warnDup = true) {
+    for (const skill of list) {
+      if (skillsMap.has(skill.name)) {
+        if (warnDup) {
+          const existing = skillsMap.get(skill.name)!;
+          console.warn(
+            `[openrouter-skills] Duplicate skill "${skill.name}" ` +
+            `(keeping ${existing.dirPath}, skipping ${skill.dirPath}).`
+          );
+        }
+        continue;
+      }
+      skillsMap.set(skill.name, skill);
+      try {
+        const s = await stat(join(skill.dirPath, 'SKILL.md'));
+        mtimes.set(skill.name, s.mtimeMs);
+      } catch { /* skill without stat — won't auto-refresh */ }
     }
-    skillsMap.set(skill.name, skill);
   }
 
-  const skillNames = skillsList.map((s) => s.name);
+  await addSkills(skillsList);
 
-  async function handleToolCall(
-    name: string,
-    args: Record<string, unknown>,
-  ): Promise<SkillExecutionResult> {
-    if (name === 'load_skill') {
-      const skillName = String(args.skill ?? '');
-      const skill = skillsMap.get(skillName);
-      if (!skill) {
-        return fail('SkillNotFound', `"${skillName}" not found. Available: ${skillNames.join(', ')}`);
-      }
-      return { success: true, stdout: skill.content, stderr: '', exitCode: 0 };
-    }
+  /** Re-parse a single skill if its SKILL.md mtime changed. */
+  async function refreshIfStale(skillName: string): Promise<void> {
+    const skill = skillsMap.get(skillName);
+    if (!skill) return;
 
-    if (name === 'use_skill') {
-      const skillName = String(args.skill ?? '');
-      const script = String(args.script ?? '');
-      const rawArgs = args.args;
+    try {
+      const s = await stat(join(skill.dirPath, 'SKILL.md'));
+      const cached = mtimes.get(skillName);
+      if (cached !== undefined && s.mtimeMs === cached) return;
 
-      let scriptArgs: string[] = [];
-      if (Array.isArray(rawArgs)) {
-        scriptArgs = rawArgs.map(String);
-      } else if (rawArgs !== undefined && rawArgs !== null) {
-        return fail('InvalidArgs', `args must be an array of strings, got ${typeof rawArgs}`);
-      }
-
-      const skill = skillsMap.get(skillName);
-      if (!skill) {
-        return fail('SkillNotFound');
-      }
-
-      if (!skill.scripts.includes(script)) {
-        return fail('ScriptNotAllowed', `"${script}" not registered for "${skillName}". Available: ${skill.scripts.join(', ') || 'none'}`);
-      }
-
-      return executeScript({
-        skillDir: skill.dirPath,
-        script,
-        args: scriptArgs,
-        timeout: options.timeout,
-        maxOutput: options.maxOutput,
-        cwd: options.cwd,
-        env: options.env,
-      });
-    }
-
-    return fail('UnknownTool', `Unknown tool: ${name}. Available: load_skill, use_skill`);
+      const updated = await loadSkill(skill.dirPath, skillName);
+      skillsMap.set(skillName, updated);
+      mtimes.set(skillName, s.mtimeMs);
+    } catch { /* stat/parse failed — keep existing */ }
   }
 
-  return { handleToolCall, skillNames, skills: skillsMap };
+  /** Re-discover all dirs to find newly added skills. */
+  async function rediscover(): Promise<void> {
+    const nested = await Promise.all(resolvedDirs.map(d => discoverSkills(d, filterOpts)));
+    await addSkills(nested.flat(), false);
+  }
+
+  // skillNames is a live getter so it reflects newly discovered skills
+  const provider: SkillsProvider = {
+    get skillNames() { return [...skillsMap.keys()]; },
+    skills: skillsMap,
+    handleToolCall: async (name, args) => {
+      if (name === 'load_skill') {
+        const skillName = String(args.skill ?? '');
+
+        let skill = skillsMap.get(skillName);
+        if (skill) {
+          await refreshIfStale(skillName);
+          skill = skillsMap.get(skillName)!;
+        } else {
+          // Not found — maybe it was added since startup
+          await rediscover();
+          skill = skillsMap.get(skillName);
+        }
+        if (!skill) {
+          return fail('SkillNotFound', `"${skillName}" not found. Available: ${provider.skillNames.join(', ')}`);
+        }
+        return { success: true, stdout: skill.content, stderr: '', exitCode: 0 };
+      }
+
+      if (name === 'use_skill') {
+        const skillName = String(args.skill ?? '');
+        const script = String(args.script ?? '');
+        const rawArgs = args.args;
+
+        let scriptArgs: string[] = [];
+        if (Array.isArray(rawArgs)) {
+          scriptArgs = rawArgs.map(String);
+        } else if (rawArgs !== undefined && rawArgs !== null) {
+          return fail('InvalidArgs', `args must be an array of strings, got ${typeof rawArgs}`);
+        }
+
+        await refreshIfStale(skillName);
+
+        let skill = skillsMap.get(skillName);
+        if (!skill) {
+          return fail('SkillNotFound');
+        }
+
+        // If script not found, force a full re-parse (script may have been added
+        // without touching SKILL.md, so mtime check alone won't catch it)
+        if (!skill.scripts.includes(script)) {
+          mtimes.delete(skillName); // force re-parse
+          await refreshIfStale(skillName);
+          skill = skillsMap.get(skillName)!;
+        }
+
+        if (!skill.scripts.includes(script)) {
+          return fail('ScriptNotAllowed', `"${script}" not registered for "${skillName}". Available: ${skill.scripts.join(', ') || 'none'}`);
+        }
+
+        return executeScript({
+          skillDir: skill.dirPath,
+          script,
+          args: scriptArgs,
+          timeout: options.timeout,
+          maxOutput: options.maxOutput,
+          cwd: options.cwd,
+          env: options.env,
+        });
+      }
+
+      return fail('UnknownTool', `Unknown tool: ${name}. Available: load_skill, use_skill`);
+    },
+  };
+
+  return provider;
 }
 
 // --- SDK Tools ---
@@ -225,7 +271,7 @@ export function createSdkTools(provider: SkillsProvider) {
       'Refer to the skill instructions already in your context for available scripts and arguments.',
     inputSchema: z.object({
       skill: z.string().describe('The skill that provides the script.'),
-      script: z.string().describe('The script filename to run.'),
+      script: z.string().describe('The script filename to run as outlined in the skill (ex. skill.mjs, cli.js, run.sh).'),
       args: z.array(z.string()).default([]).describe('Arguments to pass to the script.'),
       remember: z.boolean().default(false).describe(
         'Set to true if you want to reference the result of this request as you continue to perform your work - be conservative.'
@@ -250,11 +296,25 @@ export function createSdkTools(provider: SkillsProvider) {
  * ```
  */
 export async function createSkillsTools(
-  skillsDir: string,
+  skillsDirs: string | string[],
   options: SkillsProviderOptions = {},
 ) {
-  const provider = await createSkillsProvider(skillsDir, options);
+  const provider = await createSkillsProvider(skillsDirs, options);
   return createSdkTools(provider);
+}
+
+/**
+ * Create manual tools (execute: false) from SDK tools.
+ *
+ * Use these with a custom multi-turn loop for real streaming between turns.
+ * The SDK's auto-execution batches items across turns; manual tools let you
+ * call `callModel` per turn and stream each turn independently.
+ */
+export function createManualTools(sdkTools: ReturnType<typeof createSdkTools>) {
+  return sdkTools.map(t => ({
+    ...t,
+    function: { ...t.function, execute: false, nextTurnParams: undefined },
+  }));
 }
 
 // --- Turn processing helper ---
@@ -280,7 +340,10 @@ export async function createSkillsTools(
  * ```
  */
 export async function processTurn(
-  result: { getItemsStream(): AsyncIterable<Record<string, unknown>>; getText(): Promise<string> },
+  result: {
+    getItemsStream(): AsyncIterable<Record<string, unknown>>;
+    getText(): Promise<string>;
+  },
   onEvent?: (event: TurnEvent) => void,
 ): Promise<TurnOutput> {
   const seenCalls = new Set<string>();
@@ -288,6 +351,9 @@ export async function processTurn(
   const callNames = new Map<string, string>();
   const skipCallIds = new Set<string>();
   const history: unknown[] = [];
+
+  // Track cumulative text from message items to compute deltas
+  let streamedText = '';
 
   for await (const item of result.getItemsStream()) {
     if (item.type === 'function_call') {
@@ -334,9 +400,28 @@ export async function processTurn(
           result: item.output as string,
         });
       }
+    } else if (item.type === 'message') {
+      // Extract text from cumulative message content and emit deltas
+      const content = item.content;
+      let text = '';
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part && typeof part === 'object' && 'text' in part) {
+            text += (part as { text: string }).text;
+          }
+        }
+      } else if (typeof content === 'string') {
+        text = content;
+      }
+      if (text.length > streamedText.length) {
+        const delta = text.slice(streamedText.length);
+        streamedText = text;
+        onEvent?.({ type: 'text_delta', delta });
+      }
     }
   }
 
-  const text = await result.getText();
+  // Fall back to getText() if no text was streamed from message items
+  const text = streamedText || await result.getText();
   return { text, history };
 }

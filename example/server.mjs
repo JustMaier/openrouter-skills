@@ -1,14 +1,28 @@
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { join, extname, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { OpenRouter, stepCountIs } from '@openrouter/sdk';
-import { createSkillsProvider, createSdkTools, processTurn } from '../dist/index.js';
+import { OpenRouter } from '@openrouter/sdk';
+import { createSkillsProvider, createSdkTools, createManualTools, toToolResult } from '../dist/index.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PORT = process.env.PORT ?? 3000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const DEFAULT_MODEL = process.env.MODEL ?? 'anthropic/claude-sonnet-4';
+
+// Models available in the UI dropdown (edit this list to add/remove models)
+const MODELS = [
+  'x-ai/grok-4.1-fast',
+  'openai/gpt-5-nano',
+  'openai/gpt-oss-120b:free',
+  'openai/gpt-oss-20b:free',
+  'arcee-ai/trinity-large-preview:free',
+  'z-ai/glm-4.7-flash',
+  'xiaomi/mimo-v2-flash',
+  'nvidia/nemotron-3-nano-30b-a3b',
+  'stepfun/step-3.5-flash:free',
+];
 
 if (!OPENROUTER_API_KEY) {
   console.error('Missing OPENROUTER_API_KEY. Copy .env.example to .env and set your key.');
@@ -17,9 +31,16 @@ if (!OPENROUTER_API_KEY) {
 
 // --- Skills setup ---
 
-const skills = await createSkillsProvider(join(__dirname, 'skills'));
-const sdkTools = createSdkTools(skills);
+const skillsDirs = [
+  join(__dirname, 'skills'),                // project-local example skills
+  join(homedir(), '.claude', 'skills'),     // user-scope Claude skills
+];
+const skills = await createSkillsProvider(skillsDirs);
 console.log(`Loaded skills: ${skills.skillNames.join(', ')}`);
+
+// Manual tools (execute: false) — we run tools ourselves between turns for real streaming
+const sdkTools = createSdkTools(skills);
+const manualTools = createManualTools(sdkTools);
 
 const client = new OpenRouter({ apiKey: OPENROUTER_API_KEY });
 
@@ -75,7 +96,13 @@ async function serveStatic(req, res) {
   }
 }
 
-// --- Chat API endpoint using SDK callModel ---
+// --- Helpers for manual multi-turn streaming ---
+
+function sse(res, data) {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+// --- Chat API endpoint — manual multi-turn loop for real streaming ---
 
 async function handleChat(req, res) {
   let body = '';
@@ -104,42 +131,113 @@ async function handleChat(req, res) {
 
   console.log(`[chat] session=${sessionId.slice(0, 8)} model=${model} messages=${messages.length}`);
 
-  // SSE response
+  // SSE response — disable Nagle and proxy buffering so events flush immediately
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
     'Access-Control-Allow-Origin': '*',
   });
+  res.flushHeaders();
+  res.socket?.setNoDelay?.(true);
 
-  // Send sessionId so client can use it for subsequent requests
-  res.write(`data: ${JSON.stringify({ type: 'session', sessionId })}\n\n`);
+  sse(res, { type: 'session', sessionId });
 
   try {
-    const result = client.callModel({
-      model,
-      instructions: 'You are a helpful assistant with access to skills.\n' +
-        'When the user asks you to do something covered by a skill, load it first, then use it.',
-      input: messages,
-      tools: sdkTools,
-      stopWhen: stepCountIs(10),
-    });
+    let instructions =
+      'You are a helpful assistant with access to skills.\n' +
+      'When the user asks you to do something covered by a skill, load it first, then use it.';
+    // Build turn-local input: session messages + any tool call/result pairs from this request
+    const turnItems = [];
+    let finalText = '';
+    const MAX_STEPS = 10;
 
-    const { text, history } = await processTurn(result, (event) => {
-      if (event.type === 'tool_call') {
-        res.write(`data: ${JSON.stringify({ type: 'tool_call', name: event.name, arguments: event.arguments })}\n\n`);
-      } else {
-        res.write(`data: ${JSON.stringify({ type: 'tool_result', name: event.name, result: event.result })}\n\n`);
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const result = client.callModel({
+        model,
+        instructions,
+        input: [...messages, ...turnItems],
+        tools: manualTools,
+      });
+
+      // Stream text deltas from this single turn
+      let turnText = '';
+      for await (const delta of result.getTextStream()) {
+        turnText += delta;
+        sse(res, { type: 'text_delta', delta });
       }
-    });
 
-    res.write(`data: ${JSON.stringify({ type: 'content', content: text })}\n\n`);
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      // Get the full response to check for tool calls
+      const response = await result.getResponse();
+      const toolCalls = (response.output ?? []).filter(o => o.type === 'function_call');
 
-    messages.push(...history);
-    messages.push({ role: 'assistant', content: text });
+      if (toolCalls.length === 0) {
+        // No tool calls — model produced a text response, we're done
+        finalText = turnText || response.output
+          ?.filter(o => o.type === 'message')
+          .flatMap(o => o.content ?? [])
+          .filter(p => p.type === 'output_text')
+          .map(p => p.text)
+          .join('') || '';
+        break;
+      }
+
+      // Process each tool call: execute, stream events, build history
+      for (const tc of toolCalls) {
+        const name = tc.name;
+        const args = JSON.parse(tc.arguments ?? '{}');
+        const callId = tc.callId ?? tc.id;
+
+        sse(res, { type: 'tool_call', name, arguments: tc.arguments });
+
+        // Execute the tool via the provider
+        const execResult = await skills.handleToolCall(name, args);
+        const toolResult = toToolResult(execResult);
+
+        sse(res, { type: 'tool_result', name, result: JSON.stringify(toolResult) });
+
+        // Handle instruction injection for load_skill (replaces nextTurnParams)
+        if (name === 'load_skill' && execResult.success) {
+          const marker = `[Skill: ${args.skill}]`;
+          if (!instructions.includes(marker)) {
+            instructions += `\n\n${marker}\n${execResult.stdout}`;
+          }
+        }
+
+        // Add tool call + result to turn history for the next callModel turn
+        turnItems.push({ type: 'function_call', callId, name, arguments: tc.arguments });
+        turnItems.push({ type: 'function_call_output', callId, output: JSON.stringify(toolResult) });
+      }
+    }
+
+    // Send authoritative full text + done
+    sse(res, { type: 'content', content: finalText });
+    sse(res, { type: 'done' });
+
+    // Persist to session: only remembered tool calls + final assistant message
+    for (const item of turnItems) {
+      if (item.type === 'function_call') {
+        try {
+          const args = JSON.parse(item.arguments ?? '{}');
+          // Always keep load_skill; only keep use_skill when remember: true
+          if (item.name === 'load_skill' || args.remember === true) {
+            messages.push(item);
+          }
+        } catch { /* skip */ }
+      } else if (item.type === 'function_call_output') {
+        // Keep output if its corresponding call was kept
+        const prevMsg = messages[messages.length - 1];
+        if (prevMsg?.type === 'function_call' && prevMsg.callId === item.callId) {
+          messages.push(item);
+        }
+      }
+    }
+    if (finalText) {
+      messages.push({ role: 'assistant', content: finalText });
+    }
   } catch (err) {
-    res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+    sse(res, { type: 'error', error: err.message });
   }
 
   res.end();
@@ -166,7 +264,7 @@ const server = createServer(async (req, res) => {
 
   if (req.method === 'GET' && req.url === '/api/config') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ defaultModel: DEFAULT_MODEL, skills: skills.skillNames }));
+    res.end(JSON.stringify({ defaultModel: DEFAULT_MODEL, models: MODELS, skills: skills.skillNames }));
     return;
   }
 

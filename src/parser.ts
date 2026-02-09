@@ -103,7 +103,7 @@ export async function parseSkillFile(
  * Collect script filenames from a directory (non-recursive).
  * Returns only files whose extensions are in SCRIPT_EXTENSIONS.
  */
-async function collectScripts(dir: string): Promise<string[]> {
+export async function collectScripts(dir: string): Promise<string[]> {
   const scripts: string[] = [];
   let entries: import('node:fs').Dirent[];
   try {
@@ -119,6 +119,30 @@ async function collectScripts(dir: string): Promise<string[]> {
     }
   }
   return scripts;
+}
+
+/**
+ * Load a single skill from a directory containing a SKILL.md file.
+ *
+ * Parses the SKILL.md and collects scripts (from root and `scripts/` subfolder)
+ * in parallel. Used by both `discoverSkills` and the provider's hot-reload path.
+ *
+ * @param dirPath - Absolute path to the skill directory
+ * @param fallbackName - Name to use if SKILL.md has no `name` in frontmatter
+ */
+export async function loadSkill(dirPath: string, fallbackName: string): Promise<SkillDefinition> {
+  const parsed = await parseSkillFile(join(dirPath, SKILL_FILENAME));
+  const [topScripts, subScripts] = await Promise.all([
+    collectScripts(dirPath),
+    collectScripts(join(dirPath, 'scripts')),
+  ]);
+  return {
+    name: parsed.name || fallbackName,
+    description: parsed.description,
+    content: parsed.content,
+    dirPath,
+    scripts: [...topScripts, ...subScripts.map(s => `scripts/${s}`)],
+  };
 }
 
 /**
@@ -163,37 +187,16 @@ export async function discoverSkills(
     }
 
     const skillDir = join(resolvedDir, folderName);
-    const skillFilePath = join(skillDir, SKILL_FILENAME);
 
     // Check that SKILL.md exists
     try {
-      const fileStat = await stat(skillFilePath);
+      const fileStat = await stat(join(skillDir, SKILL_FILENAME));
       if (!fileStat.isFile()) continue;
     } catch {
       continue;
     }
 
-    // Parse the SKILL.md
-    const parsed = await parseSkillFile(skillFilePath);
-
-    // Collect scripts from the skill directory and scripts/ subfolder
-    const topScripts = await collectScripts(skillDir);
-    const scriptsSubdir = join(skillDir, 'scripts');
-    const subScripts = await collectScripts(scriptsSubdir);
-
-    // Prefix subfolder scripts with "scripts/" so callers know the relative path
-    const allScripts = [
-      ...topScripts,
-      ...subScripts.map((s) => `scripts/${s}`),
-    ];
-
-    skills.push({
-      name: parsed.name || folderName,
-      description: parsed.description,
-      content: parsed.content,
-      dirPath: skillDir,
-      scripts: allScripts,
-    });
+    skills.push(await loadSkill(skillDir, folderName));
   }
 
   return skills;

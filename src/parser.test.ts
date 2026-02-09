@@ -101,6 +101,21 @@ describe('parseSkillFile', () => {
     assert.equal(result.name, '');
     assert.equal(result.description, 'Body only.');
   });
+
+  it('handles frontmatter with name but no body content', async () => {
+    const file = join(tempDir, 'skill-f.md');
+    await writeFile(file, [
+      '---',
+      'name: empty-body',
+      'description: A skill with no body.',
+      '---',
+    ].join('\n'));
+
+    const result = await parseSkillFile(file);
+    assert.equal(result.name, 'empty-body');
+    assert.equal(result.description, 'A skill with no body.');
+    assert.equal(result.content, '');
+  });
 });
 
 describe('discoverSkills', () => {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createSkillsProvider, createSdkTools, processTurn } from './provider.js';
+import { createSkillsProvider, createSdkTools, createManualTools, processTurn } from './provider.js';
 
 let skillsDir: string;
 
@@ -136,6 +136,17 @@ describe('createSkillsProvider', () => {
       assert.deepEqual(parsed, [{ id: '1', name: 'general' }]);
     });
 
+    it('use_skill defaults to empty args when omitted', async () => {
+      const provider = await createSkillsProvider(skillsDir);
+      const result = await provider.handleToolCall('use_skill', {
+        skill: 'weather',
+        script: 'weather.mjs',
+        // args omitted entirely
+      });
+
+      assert.equal(result.success, true);
+    });
+
     it('use_skill rejects string args with error', async () => {
       const provider = await createSkillsProvider(skillsDir);
       const result = await provider.handleToolCall('use_skill', {
@@ -180,6 +191,191 @@ describe('createSkillsProvider', () => {
       assert.equal(result.error, 'UnknownTool');
       assert.ok(result.stderr.includes('unknown_tool'));
     });
+  });
+});
+
+// --- Multiple directories tests ---
+
+describe('createSkillsProvider with multiple directories', () => {
+  let dirA: string;
+  let dirB: string;
+
+  before(async () => {
+    dirA = await createTempDir();
+    dirB = await createTempDir();
+
+    // dirA: discord + weather
+    const discordDir = join(dirA, 'discord');
+    await mkdir(discordDir);
+    await writeFile(join(discordDir, 'SKILL.md'), [
+      '---', 'name: discord', 'description: Discord from dirA.', '---', '', 'DirA discord.',
+    ].join('\n'));
+    await writeFile(join(discordDir, 'discord.mjs'), '#!/usr/bin/env node\nconsole.log("dirA");');
+
+    const weatherDir = join(dirA, 'weather');
+    await mkdir(weatherDir);
+    await writeFile(join(weatherDir, 'SKILL.md'), [
+      '---', 'name: weather', 'description: Weather from dirA.', '---', '', 'DirA weather.',
+    ].join('\n'));
+
+    // dirB: discord (duplicate) + calendar (unique)
+    const discordDir2 = join(dirB, 'discord');
+    await mkdir(discordDir2);
+    await writeFile(join(discordDir2, 'SKILL.md'), [
+      '---', 'name: discord', 'description: Discord from dirB.', '---', '', 'DirB discord.',
+    ].join('\n'));
+    await writeFile(join(discordDir2, 'discord.mjs'), '#!/usr/bin/env node\nconsole.log("dirB");');
+
+    const calendarDir = join(dirB, 'calendar');
+    await mkdir(calendarDir);
+    await writeFile(join(calendarDir, 'SKILL.md'), [
+      '---', 'name: calendar', 'description: Calendar from dirB.', '---', '', 'DirB calendar.',
+    ].join('\n'));
+  });
+
+  after(async () => {
+    await rm(dirA, { recursive: true, force: true });
+    await rm(dirB, { recursive: true, force: true });
+  });
+
+  it('discovers skills from both directories', async () => {
+    const provider = await createSkillsProvider([dirA, dirB]);
+    assert.ok(provider.skillNames.includes('discord'));
+    assert.ok(provider.skillNames.includes('weather'));
+    assert.ok(provider.skillNames.includes('calendar'));
+    assert.equal(provider.skills.size, 3);
+  });
+
+  it('first directory wins for duplicates', async () => {
+    const provider = await createSkillsProvider([dirA, dirB]);
+    const discord = provider.skills.get('discord')!;
+    assert.ok(discord.description.includes('dirA'));
+    assert.ok(discord.dirPath.startsWith(dirA));
+  });
+
+  it('single string still works (backwards compat)', async () => {
+    const provider = await createSkillsProvider(dirA);
+    assert.ok(provider.skillNames.includes('discord'));
+    assert.ok(provider.skillNames.includes('weather'));
+    assert.equal(provider.skills.size, 2);
+  });
+
+  it('handles empty array gracefully', async () => {
+    const provider = await createSkillsProvider([]);
+    assert.equal(provider.skills.size, 0);
+    assert.deepEqual(provider.skillNames, []);
+  });
+
+  it('handles non-existent directory in array gracefully', async () => {
+    const bogus = join(dirA, 'does-not-exist');
+    const provider = await createSkillsProvider([dirA, bogus]);
+    // Skills from dirA should still be available
+    assert.ok(provider.skillNames.includes('discord'));
+    assert.ok(provider.skillNames.includes('weather'));
+  });
+});
+
+// --- Hot reload tests ---
+
+describe('skill hot reload', () => {
+  let hotDir: string;
+
+  before(async () => {
+    hotDir = await createTempDir();
+
+    const alphaDir = join(hotDir, 'alpha');
+    await mkdir(alphaDir);
+    await writeFile(join(alphaDir, 'SKILL.md'), [
+      '---', 'name: alpha', 'description: Alpha v1.', '---', '', 'Alpha version 1.',
+    ].join('\n'));
+    await writeFile(join(alphaDir, 'run.mjs'), '#!/usr/bin/env node\nconsole.log("v1");');
+  });
+
+  after(async () => {
+    await rm(hotDir, { recursive: true, force: true });
+  });
+
+  it('returns updated content after SKILL.md changes', async () => {
+    const provider = await createSkillsProvider(hotDir);
+
+    // Initial load
+    const r1 = await provider.handleToolCall('load_skill', { skill: 'alpha' });
+    assert.ok(r1.stdout.includes('Alpha version 1'));
+
+    // Mutate SKILL.md — need a small delay so mtime actually differs
+    await new Promise(r => setTimeout(r, 50));
+    await writeFile(join(hotDir, 'alpha', 'SKILL.md'), [
+      '---', 'name: alpha', 'description: Alpha v2.', '---', '', 'Alpha version 2.',
+    ].join('\n'));
+
+    // Next load should pick up the change
+    const r2 = await provider.handleToolCall('load_skill', { skill: 'alpha' });
+    assert.ok(r2.stdout.includes('Alpha version 2'));
+  });
+
+  it('picks up new scripts added after creation', async () => {
+    const provider = await createSkillsProvider(hotDir);
+    const skill1 = provider.skills.get('alpha')!;
+    const hadNew = skill1.scripts.includes('new.mjs');
+    assert.equal(hadNew, false);
+
+    // Add a new script and touch SKILL.md so mtime changes
+    await new Promise(r => setTimeout(r, 50));
+    await writeFile(join(hotDir, 'alpha', 'new.mjs'), '#!/usr/bin/env node\nconsole.log("new");');
+    await writeFile(join(hotDir, 'alpha', 'SKILL.md'), [
+      '---', 'name: alpha', 'description: Alpha v3.', '---', '', 'Alpha version 3.',
+    ].join('\n'));
+
+    // use_skill triggers refresh, so scripts list should update
+    await provider.handleToolCall('load_skill', { skill: 'alpha' });
+    const skill2 = provider.skills.get('alpha')!;
+    assert.ok(skill2.scripts.includes('new.mjs'));
+  });
+
+  it('discovers newly added skills on load_skill miss', async () => {
+    const provider = await createSkillsProvider(hotDir);
+    assert.equal(provider.skills.has('beta'), false);
+
+    // Add a new skill directory
+    const betaDir = join(hotDir, 'beta');
+    await mkdir(betaDir);
+    await writeFile(join(betaDir, 'SKILL.md'), [
+      '---', 'name: beta', 'description: Beta skill.', '---', '', 'Beta content.',
+    ].join('\n'));
+
+    // load_skill for unknown name triggers rediscovery
+    const r = await provider.handleToolCall('load_skill', { skill: 'beta' });
+    assert.equal(r.success, true);
+    assert.ok(r.stdout.includes('Beta content'));
+    assert.ok(provider.skillNames.includes('beta'));
+  });
+
+  it('does not re-parse when mtime is unchanged', async () => {
+    const provider = await createSkillsProvider(hotDir);
+
+    // Load twice — second call should be cheap (no re-parse)
+    const r1 = await provider.handleToolCall('load_skill', { skill: 'alpha' });
+    const r2 = await provider.handleToolCall('load_skill', { skill: 'alpha' });
+    assert.equal(r1.stdout, r2.stdout);
+  });
+
+  it('picks up new script on use_skill miss without SKILL.md change', async () => {
+    const provider = await createSkillsProvider(hotDir);
+
+    // Add a script file without touching SKILL.md
+    const scriptPath = join(hotDir, 'alpha', 'added.mjs');
+    await writeFile(scriptPath, '#!/usr/bin/env node\nconsole.log("added");');
+
+    // First use_skill should miss, force re-parse, then find the script
+    const r = await provider.handleToolCall('use_skill', {
+      skill: 'alpha', script: 'added.mjs', args: [],
+    });
+    assert.equal(r.success, true);
+    assert.ok(r.stdout.includes('added'));
+
+    // Clean up so other tests aren't affected
+    const { unlink } = await import('node:fs/promises');
+    await unlink(scriptPath);
   });
 });
 
@@ -335,6 +531,33 @@ describe('createSdkTools', () => {
   });
 });
 
+// --- createManualTools tests ---
+
+describe('createManualTools', () => {
+  it('disables execute and removes nextTurnParams', async () => {
+    const provider = await createSkillsProvider(exampleSkillsDir);
+    const sdkTools = createSdkTools(provider);
+    const manual = createManualTools(sdkTools);
+
+    assert.equal(manual.length, sdkTools.length);
+    for (const t of manual) {
+      assert.equal(t.function.execute, false);
+      assert.equal(t.function.nextTurnParams, undefined);
+    }
+  });
+
+  it('preserves tool names and descriptions', async () => {
+    const provider = await createSkillsProvider(exampleSkillsDir);
+    const sdkTools = createSdkTools(provider);
+    const manual = createManualTools(sdkTools);
+
+    for (let i = 0; i < sdkTools.length; i++) {
+      assert.equal(manual[i].function.name, sdkTools[i].function.name);
+      assert.equal(manual[i].function.description, sdkTools[i].function.description);
+    }
+  });
+});
+
 // --- processTurn tests ---
 
 function fakeResult(items: Record<string, unknown>[], text: string) {
@@ -465,6 +688,23 @@ describe('processTurn', () => {
     assert.equal(events.length, 2); // only the completed call + output
   });
 
+  it('emits orphaned function_call_output without matching call', async () => {
+    const items = [
+      // Output arrives without a prior function_call
+      { type: 'function_call_output', callId: 'orphan1', output: '{"ok":true}' },
+    ];
+
+    const events: { type: string; name?: string }[] = [];
+    const { history } = await processTurn(fakeResult(items, 'OK'), (e) => events.push(e));
+
+    // Should still emit the event (name falls back to 'unknown')
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'tool_result');
+    assert.equal(events[0].name, 'unknown');
+    // Should be included in history (no skipCallIds entry)
+    assert.equal(history.length, 1);
+  });
+
   it('works with no onEvent callback', async () => {
     const items = [
       { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
@@ -475,5 +715,64 @@ describe('processTurn', () => {
 
     assert.equal(text, 'OK');
     assert.equal(history.length, 2);
+  });
+
+  it('streams text deltas from message items', async () => {
+    const items: Record<string, unknown>[] = [
+      { type: 'message', content: [{ type: 'output_text', text: 'Hello' }] },
+      { type: 'message', content: [{ type: 'output_text', text: 'Hello world' }] },
+      { type: 'message', content: [{ type: 'output_text', text: 'Hello world!' }] },
+    ];
+
+    const events: { type: string; delta?: string }[] = [];
+    const { text } = await processTurn(fakeResult(items, 'Hello world!'), (e) => events.push(e));
+
+    assert.equal(text, 'Hello world!');
+    const textEvents = events.filter(e => e.type === 'text_delta');
+    assert.equal(textEvents.length, 3);
+    assert.equal(textEvents[0].delta, 'Hello');
+    assert.equal(textEvents[1].delta, ' world');
+    assert.equal(textEvents[2].delta, '!');
+  });
+
+  it('handles message items with string content', async () => {
+    const items: Record<string, unknown>[] = [
+      { type: 'message', content: 'Hello' },
+      { type: 'message', content: 'Hello world' },
+    ];
+
+    const events: { type: string; delta?: string }[] = [];
+    const { text } = await processTurn(fakeResult(items, 'Hello world'), (e) => events.push(e));
+
+    assert.equal(text, 'Hello world');
+    const textEvents = events.filter(e => e.type === 'text_delta');
+    assert.equal(textEvents.length, 2);
+    assert.equal(textEvents[0].delta, 'Hello');
+    assert.equal(textEvents[1].delta, ' world');
+  });
+
+  it('falls back to getText() when no message items are present', async () => {
+    const items: Record<string, unknown>[] = [];
+
+    const { text } = await processTurn(fakeResult(items, 'Fallback text'));
+
+    assert.equal(text, 'Fallback text');
+  });
+
+  it('emits text_delta events alongside tool events', async () => {
+    const items: Record<string, unknown>[] = [
+      { type: 'function_call', callId: 'c1', name: 'load_skill', arguments: '{"skill":"weather"}', status: 'completed' },
+      { type: 'function_call_output', callId: 'c1', output: '{"ok":true}' },
+      { type: 'message', content: [{ type: 'output_text', text: 'Sunny' }] },
+      { type: 'message', content: [{ type: 'output_text', text: 'Sunny today.' }] },
+    ];
+
+    const events: { type: string }[] = [];
+    const { text } = await processTurn(fakeResult(items, 'Sunny today.'), (e) => events.push(e));
+
+    assert.equal(text, 'Sunny today.');
+    assert.ok(events.some(e => e.type === 'tool_call'));
+    assert.ok(events.some(e => e.type === 'tool_result'));
+    assert.ok(events.some(e => e.type === 'text_delta'));
   });
 });
