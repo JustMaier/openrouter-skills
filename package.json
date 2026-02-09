@@ -16,7 +16,11 @@
     "dev": "tsc --watch",
     "test": "tsx --test src/**/*.test.ts",
     "lint": "tsc --noEmit",
-    "example": "npm run build && node --env-file=example/.env example/server.mjs"
+    "example": "npm run build && node --env-file=example/.env example/server.mjs",
+    "release": "node scripts/publish.mjs patch",
+    "release:patch": "node scripts/publish.mjs patch",
+    "release:minor": "node scripts/publish.mjs minor",
+    "release:major": "node scripts/publish.mjs major"
   },
   "files": [
     "dist",
